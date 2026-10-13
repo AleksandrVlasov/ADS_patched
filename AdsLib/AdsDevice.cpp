@@ -1,358 +1,219 @@
-#include "adsdevice.h"
-#include "AdsFile.h"
-#include "AmsRouter.h"
+// SPDX-License-Identifier: MIT
+/**
+   Copyright (c) 2016 - 2022 Beckhoff Automation GmbH & Co. KG
+ */
 
-#define PLC_FLAG_AREA 0x4020
+#include "AdsDevice.h"
+#include "AdsException.h"
+#include "AdsLib.h"
+#include <limits>
 
-Adsdevice::Adsdevice(const AmsNetId& netId) :
-	router(netId)
+static AmsNetId *AddRoute(AmsNetId ams, const char *ip)
 {
-	m_port = router.OpenPort();
+	const auto error = bhf::ads::AddLocalRoute(ams, ip);
+	if (error) {
+		throw AdsException(error);
+	}
+	return new AmsNetId{ ams };
 }
 
-Adsdevice::~Adsdevice()
+AdsDevice::AdsDevice(const std::string &ipV4, AmsNetId netId, uint16_t port)
+	: m_NetId(AddRoute(netId, ipV4.c_str()), { [](AmsNetId ams) {
+			  bhf::ads::DelLocalRoute(ams);
+			  return 0;
+		  } })
+	, m_Addr({ netId, port })
+	, m_LocalPort(new long{ AdsPortOpenEx() }, { AdsPortCloseEx })
 {
-	close();
-	router.ClosePort(m_port);
 }
 
-long Adsdevice::open(const std::string& ip, const AmsNetId& netId)
+long AdsDevice::DeleteNotificationHandle(uint32_t handle) const
 {
-	// Если уже было открыто соединение — корректно закрываем старые маршруты
-	if (m_connected) {
-		close();
+	if (handle) {
+		return AdsSyncDelDeviceNotificationReqEx(GetLocalPort(),
+							 &m_Addr, handle);
 	}
-
-	// Сохраняем целевой NetId в структуру адреса устройства
-	m_addr.netId = netId;
-
-	// 1. Добавляем основной маршрут для TwinCAT PLC (например, 192.168.1.10.1.1)
-	long nErr = router.AddRoute(m_addr.netId, ip);
-	if (nErr) {
-		return nErr;
-	}
-
-	// 2. Формируем NetId для EtherCAT Мастера (меняем 5-й байт на 2)
-	AmsNetId masterNetId = m_addr.netId;
-	masterNetId.b[4] = 2;
-
-	// Добавляем маршрут для EtherCAT Мастера (в обход среды исполнения PLC)
-	nErr = router.AddRoute(masterNetId, ip);
-	if (nErr) {
-		// Если второй маршрут не добавился — откатываем первый, чтобы не плодить мусор
-		router.DelRoute(m_addr.netId);
-		return nErr;
-	}
-
-	m_connected = true;
 	return 0;
 }
 
-void Adsdevice::close()
+long AdsDevice::CloseFile(uint32_t handle) const
 {
-	if (m_connected || m_addr.netId.b[0] != 0) {
-		router.DelRoute(m_addr.netId);
-		AmsNetId masterNetId = m_addr.netId;
-		masterNetId.b[4] = 2;
-		router.DelRoute(masterNetId);
-		m_connected = false;
+	return ReadWriteReqEx2(SYSTEMSERVICE_FCLOSE, handle, 0, nullptr, 0,
+			       nullptr, nullptr);
+}
+
+long AdsDevice::DeleteSymbolHandle(uint32_t handle) const
+{
+	return WriteReqEx(ADSIGRP_SYM_RELEASEHND, 0, sizeof(handle), &handle);
+}
+
+DeviceInfo AdsDevice::GetDeviceInfo() const
+{
+	DeviceInfo info;
+	auto error = AdsSyncReadDeviceInfoReqEx(GetLocalPort(), &m_Addr,
+						&info.name[0], &info.version);
+
+	if (error) {
+		throw AdsException(error);
 	}
+	return info;
 }
 
-long Adsdevice::readStatus(uint16_t *as, uint16_t *ds)
+AdsHandle AdsDevice::GetHandle(const uint32_t offset) const
 {
-	if(m_connected)
-	{
-		AmsAddr localAddr = m_addr;
-		localAddr.port = 801;
-
-		int16_t buffer[2];
-		AmsRequest request{ localAddr, m_port, AoEHeader::READ_STATE,
-				    sizeof(buffer), buffer };
-		const auto status = router.AdsRequest(request);
-		if (!status) {
-			*as = bhf::ads::letoh(buffer[0]);
-			*ds = bhf::ads::letoh(buffer[1]);
-		}
-		return status;
-	}
-	return -1;
+	static const auto deleter =
+		ResourceDeleter<uint32_t>{ [](uint32_t) { return 0; } };
+	return { new uint32_t{ offset }, deleter };
 }
 
-long Adsdevice::sendSystemRestart()
+AdsHandle AdsDevice::GetHandle(const std::string &symbolName) const
 {
-	if (!m_connected) return -1;
-	AmsAddr localAddr = m_addr;
-	localAddr.port = 10000;
-	AmsRequest req{ localAddr, m_port, AoEHeader::WRITE_CONTROL, 0, nullptr };
-	req.frame.prepend(WriteControlHeader{ 2, 0, 0 });
-	return router.AdsRequest(req);
-}
-
-long Adsdevice::readByName(uint16_t port, const std::string& name, char* buff, uint32_t size)
-{
-	if (!m_connected) return -1;
-
-	AmsAddr localAddr = m_addr;
-	localAddr.port = port; // Изменяем порт только для локальной копии!
-
 	uint32_t handle = 0;
-	long nErr = setVarHandler(localAddr, name, &handle);
-	if (nErr) return nErr;
-
-	nErr = readByHandle(localAddr, handle, buff, size);
-	resetVarHandler(localAddr, handle);
-	return nErr;
-}
-
-long Adsdevice::readFlags(uint16_t port, uint32_t offset, char *buff, uint32_t size)
-{
-	if(m_connected)
-	{
-		uint32_t bytesRead;
-		AmsAddr localAddr = m_addr;
-		localAddr.port = port;
-		AmsRequest request{ localAddr, m_port, AoEHeader::READ,
-				    size, reinterpret_cast<void*>(buff), &bytesRead, sizeof(AoERequestHeader) };
-		request.frame.prepend(AoERequestHeader{ PLC_FLAG_AREA, offset, size });
-		return router.AdsRequest(request);
-	}
-	return -1;
-}
-
-long Adsdevice::writeFlags(uint16_t port, uint32_t offset, const char *buff, uint32_t size)
-{
-	if(m_connected)
-	{
-		AmsAddr localAddr = m_addr;
-		localAddr.port = port;
-		AmsRequest request{ localAddr, m_port, AoEHeader::WRITE,
-				    0, nullptr, nullptr, sizeof(AoERequestHeader) + size};
-		request.frame.prepend(buff, size);
-		request.frame.prepend<AoERequestHeader>({ PLC_FLAG_AREA, offset, size });
-		return router.AdsRequest(request);
-	}
-	return -1;
-}
-
-long Adsdevice::readFile(const std::string& filename, char *buff, uint32_t size, uint32_t * cbReturn)
-{
-	if (m_connected)
-	{
-		uint32_t handle = 0;
-		long nErr = 0;
-
-		m_addr.port = AMSPORT_R3_SYSSERV;
-
-		// Передаем std::string во внутренний метод openFile
-		nErr = openFile(filename, (bhf::ads::FOPEN::READ | bhf::ads::FOPEN::BINARY |
-					   bhf::ads::FOPEN::ENSURE_DIR), &handle);
-		if (nErr) return nErr;
-
-		AmsRequest request{ m_addr, m_port, AoEHeader::READ_WRITE,
-				    size, buff, cbReturn, sizeof(AoEReadWriteReqHeader) };
-		request.frame.prepend(AoEReadWriteReqHeader{ SYSTEMSERVICE_FREAD, handle, size, 0 });
-
-		nErr = router.AdsRequest(request);
-		closeFile(handle);
-		return nErr;
-	}
-	return -1;
-}
-
-// --- ИСПРАВЛЕНО: Чистый C++ вариант для записи файлов ---
-long Adsdevice::writeFile(const std::string& filename, const char *buff, uint32_t size)
-{
-	if(m_connected)
-	{
-		uint32_t handle = 0;
-		uint32_t bytesRead = 0;
-		long nErr = 0;
-
-		m_addr.port = AMSPORT_R3_SYSSERV;
-
-		// Внутренний метод openFile уже принимает std::string
-		nErr = openFile(filename, (bhf::ads::FOPEN::BINARY | bhf::ads::FOPEN::WRITE |
-					   bhf::ads::FOPEN::OVERWRITE | bhf::ads::FOPEN::ENSURE_DIR), &handle);
-		if (nErr) return nErr;
-
-		AmsRequest request{ m_addr, m_port, AoEHeader::READ_WRITE,
-				    0, nullptr, &bytesRead, sizeof(AoEReadWriteReqHeader) + size };
-		request.frame.prepend(buff, size);
-		request.frame.prepend(AoEReadWriteReqHeader{ SYSTEMSERVICE_FWRITE, handle, 0, size });
-
-		nErr = router.AdsRequest(request);
-		closeFile(handle);
-		return nErr;
-	}
-	return -1;
-}
-
-// --- ИСПРАВЛЕНО: Чистый C++ вариант для удаления файлов ---
-long Adsdevice::deleteFile(const std::string& fileName)
-{
-	if(m_connected)
-	{
-		// Переменная fileName теперь изначально std::string, конвертация больше не нужна
-		uint32_t nameByteSize = static_cast<uint32_t>(fileName.size());
-		uint32_t bytesRead = 0;
-
-		AmsAddr localAddr = m_addr;
-		localAddr.port = AMSPORT_R3_SYSSERV;
-
-		AmsRequest request{ localAddr, m_port, AoEHeader::READ_WRITE,
-				    0, nullptr, &bytesRead, sizeof(AoEReadWriteReqHeader) + nameByteSize};
-
-		request.frame.prepend(fileName.data(), nameByteSize);
-		request.frame.prepend(AoEReadWriteReqHeader{ SYSTEMSERVICE_FDELETE, 0, 0, nameByteSize });
-		return router.AdsRequest(request);
-	}
-	return -1;
-}
-
-long Adsdevice::setTimeout(uint16_t value)
-{
-	return router.SetTimeout(m_port, value);
-}
-
-long Adsdevice::readImageSize(uint16_t port, uint32_t indexGroup, uint32_t* outSize)
-{
-	if (!m_connected || !outSize) return -1;
-
-	AmsAddr ecAddr = m_addr;
-	ecAddr.netId.b[4] = 1; // EtherCAT образ
-	ecAddr.port = port;
-
 	uint32_t bytesRead = 0;
-	AmsRequest request{ ecAddr, m_port, AoEHeader::READ,
-			    sizeof(uint32_t), outSize, &bytesRead, sizeof(AoERequestHeader) };
-	request.frame.prepend(AoERequestHeader{ indexGroup, 0, sizeof(uint32_t) });
+	uint32_t error = ReadWriteReqEx2(ADSIGRP_SYM_HNDBYNAME, 0,
+					 sizeof(handle), &handle,
+					 symbolName.size(), symbolName.c_str(),
+					 &bytesRead);
 
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::readImageBuffer(uint16_t port, uint32_t indexGroup, char* buff, uint32_t size, uint32_t* bytesRead)
-{
-	if (!m_connected || !buff || !bytesRead) return -1;
-
-	AmsAddr ecAddr = m_addr;
-	ecAddr.netId.b[4] = 1; // EtherCAT образ
-	ecAddr.port = port;
-	AmsRequest request{ ecAddr, m_port, AoEHeader::READ,
-			    size, reinterpret_cast<void*>(buff), bytesRead, sizeof(AoERequestHeader) };
-	request.frame.prepend(AoERequestHeader{ indexGroup, 0, size });
-
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::setVarHandler(const AmsAddr& addr, const std::string& name, uint32_t* handle)
-{
-	uint32_t nameByteSize = static_cast<uint32_t>(name.size());
-	uint32_t bytesRead = 0;
-
-	AmsRequest request{ addr, m_port, AoEHeader::READ_WRITE,
-			    4, handle, &bytesRead, sizeof(AoEReadWriteReqHeader) + nameByteSize };
-
-	request.frame.prepend(name.data(), nameByteSize);
-	request.frame.prepend(AoEReadWriteReqHeader{ ADSIGRP_SYM_HNDBYNAME, 0, 4, nameByteSize });
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::resetVarHandler(const AmsAddr &addr, uint32_t handle)
-{
-	AmsRequest request{ addr, m_port, AoEHeader::WRITE,
-			    0, nullptr, nullptr, sizeof(AoERequestHeader) + sizeof(handle) };
-	request.frame.prepend(&handle, sizeof(handle));
-	request.frame.prepend<AoERequestHeader>({ (uint32_t)ADSIGRP_SYM_RELEASEHND, 0, sizeof(handle)});
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::openFile(const std::string &name, uint32_t flags, uint32_t * handle)
-{
-	uint32_t nameByteSize = static_cast<uint32_t>(name.size());
-	uint32_t bytesRead = 0;
-	AmsRequest request{ m_addr, m_port, AoEHeader::READ_WRITE,
-			    4, handle, &bytesRead, sizeof(AoEReadWriteReqHeader) + nameByteSize };
-	request.frame.prepend(name.data(), nameByteSize);
-	request.frame.prepend(AoEReadWriteReqHeader{SYSTEMSERVICE_FOPEN, flags, 4, nameByteSize });
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::closeFile(uint32_t handle)
-{
-	uint32_t bytesRead;
-	AmsRequest request{ m_addr, m_port, AoEHeader::READ_WRITE,
-			    0, nullptr, &bytesRead,  sizeof(AoEReadWriteReqHeader)};
-	request.frame.prepend(AoEReadWriteReqHeader{SYSTEMSERVICE_FCLOSE, handle, 0, 0 });
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::readByHandle(const AmsAddr &addr, uint32_t handle, char *buff, uint32_t size)
-{
-	uint32_t bytesRead;
-	AmsRequest request{ addr, m_port, AoEHeader::READ,
-			    size, reinterpret_cast<void*>(buff), &bytesRead, sizeof(AoERequestHeader) };
-	request.frame.prepend(AoERequestHeader{ ADSIGRP_SYM_VALBYHND, handle, size });
-	return router.AdsRequest(request);
-}
-
-long Adsdevice::readECBusData(uint16_t port, uint32_t indexGroup,
-			      uint32_t indexOffset, char * buff, uint32_t size)
-{
-	if (m_connected)
-	{
-		uint32_t bytesRead = 0;
-		AmsAddr localAddr = m_addr;
-		localAddr.netId.b[4] = 2;
-		localAddr.port = port;
-		AmsRequest request{ localAddr, m_port, AoEHeader::READ,
-				    size, reinterpret_cast<void*>(buff), &bytesRead, sizeof(AoERequestHeader) };
-		request.frame.prepend(AoERequestHeader{ indexGroup, indexOffset, size });
-		long nErr = router.AdsRequest(request);
-		return nErr;
+	if (error || (sizeof(handle) != bytesRead)) {
+		throw AdsException(error);
 	}
-	return -1;
+
+	handle = bhf::ads::letoh(handle);
+	return { new uint32_t{ handle },
+		 { std::bind(&AdsDevice::DeleteSymbolHandle, this,
+			     std::placeholders::_1) } };
 }
 
-long Adsdevice::readCoE(uint16_t slaveAddress, uint16_t canopenIndex, uint8_t subIndex, char* buff, uint32_t size)
+AdsHandle
+AdsDevice::GetHandle(const uint32_t indexGroup, const uint32_t indexOffset,
+		     const AdsNotificationAttrib &notificationAttributes,
+		     PAdsNotificationFuncEx callback,
+		     const uint32_t hUser) const
 {
-	if (!m_connected) return -1;
+	uint32_t handle = 0;
+	auto error = AdsSyncAddDeviceNotificationReqEx(
+		*m_LocalPort, &m_Addr, indexGroup, indexOffset,
+		&notificationAttributes, callback, hUser, &handle);
+	if (error || !handle) {
+		throw AdsException(error);
+	}
+	handle = bhf::ads::letoh(handle);
+	return { new uint32_t{ handle },
+		 { std::bind(&AdsDevice::DeleteNotificationHandle, this,
+			     std::placeholders::_1) } };
+}
+
+long AdsDevice::GetLocalPort() const
+{
+	return *m_LocalPort;
+}
+
+AdsDeviceState AdsDevice::GetState() const
+{
+	uint16_t state[2];
+	auto error = AdsSyncReadStateReqEx(GetLocalPort(), &m_Addr, &state[0],
+					   &state[1]);
+
+	if (error) {
+		throw AdsException(error);
+	}
+
+	for (auto i : state) {
+		if (i >= ADSSTATE::ADSSTATE_MAXSTATES) {
+			throw std::out_of_range("Unknown ADSSTATE(" +
+						std::to_string(i) + ')');
+		}
+	}
+	return { static_cast<ADSSTATE>(state[0]),
+		 static_cast<ADSSTATE>(state[1]) };
+}
+
+void AdsDevice::SetState(const ADSSTATE AdsState,
+			 const ADSSTATE DeviceState) const
+{
+	auto error = AdsSyncWriteControlReqEx(GetLocalPort(), &m_Addr, AdsState,
+					      DeviceState, 0, nullptr);
+
+	if (error) {
+		throw AdsException(error);
+	}
+}
+
+void AdsDevice::SetTimeout(const uint32_t timeout) const
+{
+	const auto error = AdsSyncSetTimeoutEx(GetLocalPort(), timeout);
+	if (error) {
+		throw AdsException(error);
+	}
+}
+
+uint32_t AdsDevice::GetTimeout() const
+{
+	uint32_t timeout = 0;
+	const auto error = AdsSyncGetTimeoutEx(GetLocalPort(), &timeout);
+	if (error) {
+		throw AdsException(error);
+	}
+	return timeout;
+}
+
+AdsHandle AdsDevice::OpenFile(const std::string &filename,
+			      const uint32_t flags) const
+{
 	uint32_t bytesRead = 0;
-	AmsAddr targetAddr = m_addr;
-	targetAddr.netId.b[4] = 2;  // Направляем запрос к EtherCAT Мастеру
-	targetAddr.port = 0xFFFF;   // Системный порт мастера
-	uint32_t indexOffset = (static_cast<uint32_t>(slaveAddress) << 16) | canopenIndex;
-	CoEReadHeader coeHeader;
-	coeHeader.subIndex = subIndex;
-	coeHeader.reserved[0] = 0;
-	coeHeader.reserved[1] = 0;
-	coeHeader.reserved[2] = 0;
-	AmsRequest request{ targetAddr, m_port, AoEHeader::READ_WRITE,
-			    size, reinterpret_cast<void*>(buff), &bytesRead, sizeof(AoEReadWriteReqHeader) + sizeof(coeHeader) };
-	request.frame.prepend(reinterpret_cast<char*>(&coeHeader), sizeof(coeHeader));
-	request.frame.prepend(AoEReadWriteReqHeader{ EC_ADS_IGRP_CANOPEN_ACCESS, indexOffset, size, (uint32_t)sizeof(coeHeader) });
-	return router.AdsRequest(request);
+	uint32_t handle = 0;
+	const auto error = ReadWriteReqEx2(SYSTEMSERVICE_FOPEN, flags,
+					   sizeof(handle), &handle,
+					   filename.length(), filename.c_str(),
+					   &bytesRead);
+
+	if (error) {
+		throw AdsException(error);
+	}
+	if (bytesRead != sizeof(handle)) {
+		throw AdsException(ADSERR_DEVICE_INVALIDDATA);
+	}
+	handle = bhf::ads::letoh(handle);
+	return { new uint32_t{ handle },
+		 { std::bind(&AdsDevice::CloseFile, this,
+			     std::placeholders::_1) } };
 }
 
-long Adsdevice::writeCoE(uint16_t slaveAddress, uint16_t canopenIndex, uint8_t subIndex, const char* buff, uint32_t size)
+long AdsDevice::ReadReqEx2(uint32_t group, uint32_t offset, size_t length,
+			   void *buffer, uint32_t *bytesRead) const
 {
-	if (!m_connected) return -1;
-
-	AmsAddr targetAddr = m_addr;
-	targetAddr.netId.b[4] = 2;  // Направляем запрос к EtherCAT Мастеру
-	targetAddr.port = 0xFFFF;   // Системный порт мастера
-	uint32_t indexOffset = (static_cast<uint32_t>(slaveAddress) << 16) | canopenIndex;
-	CoEWriteHeader coeHeader;
-	coeHeader.subIndex = subIndex;
-	coeHeader.reserved[0] = 0;
-	coeHeader.reserved[1] = 0;
-	coeHeader.reserved[2] = 0;
-	uint32_t totalPayloadSize = sizeof(coeHeader) + size;
-	AmsRequest request{ targetAddr, m_port, AoEHeader::WRITE,
-			    0, nullptr, nullptr, (uint32_t)(sizeof(AoERequestHeader) + totalPayloadSize) };
-	request.frame.prepend(const_cast<char*>(buff), size);
-	request.frame.prepend(reinterpret_cast<char*>(&coeHeader), sizeof(coeHeader));
-	request.frame.prepend<AoERequestHeader>({ EC_ADS_IGRP_CANOPEN_ACCESS, indexOffset, totalPayloadSize });
-	return router.AdsRequest(request);
+	if (length > std::numeric_limits<uint32_t>::max()) {
+		return ADSERR_DEVICE_INVALIDSIZE;
+	}
+	return AdsSyncReadReqEx2(*m_LocalPort, &m_Addr, group, offset,
+				 static_cast<uint32_t>(length), buffer,
+				 bytesRead);
 }
 
+long AdsDevice::ReadWriteReqEx2(uint32_t indexGroup, uint32_t indexOffset,
+				size_t readLength, void *readData,
+				size_t writeLength, const void *writeData,
+				uint32_t *bytesRead) const
+{
+	if (readLength > std::numeric_limits<uint32_t>::max()) {
+		return ADSERR_DEVICE_INVALIDSIZE;
+	}
+	if (writeLength > std::numeric_limits<uint32_t>::max()) {
+		return ADSERR_DEVICE_INVALIDSIZE;
+	}
+	return AdsSyncReadWriteReqEx2(
+		GetLocalPort(), &m_Addr, indexGroup, indexOffset,
+		static_cast<uint32_t>(readLength), readData,
+		static_cast<uint32_t>(writeLength), writeData, bytesRead);
+}
+
+long AdsDevice::WriteReqEx(uint32_t group, uint32_t offset, size_t length,
+			   const void *buffer) const
+{
+	if (length > std::numeric_limits<uint32_t>::max()) {
+		return ADSERR_DEVICE_INVALIDSIZE;
+	}
+	return AdsSyncWriteReqEx(GetLocalPort(), &m_Addr, group, offset,
+				 static_cast<uint32_t>(length), buffer);
+}

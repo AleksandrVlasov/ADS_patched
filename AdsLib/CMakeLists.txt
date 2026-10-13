@@ -79,7 +79,8 @@ set(STANDALONE_HEADERS
 )
 
 # Create the standalone variant
-add_library(AdsLib)
+add_library(AdsLib
+        plclink.h plclink.cpp)
 target_sources(AdsLib PRIVATE
         ${STANDALONE_SOURCES}
         ${LIB_SOURCES}
