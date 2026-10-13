@@ -13,6 +13,8 @@
 #include <sstream>
 #include <system_error>
 
+std::atomic<uint32_t> g_connectionTimeoutMs{1000};
+
 namespace bhf
 {
 namespace ads
@@ -127,21 +129,103 @@ Socket::Socket(const struct addrinfo *const host, const int type)
 		if (INVALID_SOCKET == m_Socket) {
 			continue;
 		}
+
 		if (SOCK_STREAM == type) {
-			if (::connect(m_Socket, rp->ai_addr, rp->ai_addrlen)) {
-				LOG_WARN("Socket(): connect failed");
+// --- НЕБЛОКИРУЮЩИЙ CONNECT ДЛЯ WINDOWS И LINUX ---
+#if defined(_WIN32)
+			// 1. Временно переводим сокет в НЕБЛОКИРУЮЩИЙ режим
+			unsigned long iMode = 1;
+			ioctlsocket(m_Socket, FIONBIO, &iMode);
+
+			// 2. Асинхронно запускаем попытку подключения
+			int connectResult = ::connect(m_Socket, rp->ai_addr, (int)rp->ai_addrlen);
+
+			// Если соединение не установилось мгновенно (норма для неблокирующего режима)
+			if (connectResult == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+				fd_set writeSet;
+				fd_set exceptSet; // Windows сообщает об ошибках коннекта здесь!
+
+				FD_ZERO(&writeSet);
+				FD_ZERO(&exceptSet);
+				FD_SET(m_Socket, &writeSet);
+				FD_SET(m_Socket, &exceptSet);
+
+				// Загружаем актуальное значение таймаута из GUI
+				uint32_t userTimeout = g_connectionTimeoutMs.load();
+
+				timeval tv;
+				tv.tv_sec = userTimeout / 1000;
+				tv.tv_usec = (userTimeout % 1000) * 1000;
+
+				// Контролируем время ожидания и ошибки
+				int selectResult = select(0, nullptr, &writeSet, &exceptSet, &tv);
+
+				// Если вышло время (<=0) ИЛИ сокет попал в exceptSet (ошибка подключения)
+				if (selectResult <= 0 || FD_ISSET(m_Socket, &exceptSet)) {
+					closesocket(m_Socket);
+					m_Socket = INVALID_SOCKET;
+					continue; // Переходим к следующему адресу в цикле
+				}
+
+				// ИСПРАВЛЕНИЕ: Дополнительная проверка на внутреннюю ошибку сокета
+				int so_error = 0;
+				int len = sizeof(so_error);
+				getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &len);
+				if (so_error != 0) {
+					closesocket(m_Socket);
+					m_Socket = INVALID_SOCKET;
+					continue;
+				}
+			} else if (connectResult == SOCKET_ERROR) {
+				// Любая другая мгновенная ошибка (например, сеть недоступна)
 				closesocket(m_Socket);
 				m_Socket = INVALID_SOCKET;
 				continue;
 			}
-		} else { /*if (SOCK_DGRAM == type)*/
-#if defined(_WIN32) || defined(__CYGWIN__)
-			// MSVC on Windows is the only platform using different types for connect() and ai_addrlen ...
-			m_DestAddrLen = static_cast<decltype(m_DestAddrLen)>(
-				rp->ai_addrlen);
+
+			// 3. Возвращаем сокет обратно в БЛОКИРУЮЩИЙ режим для стабильной работы AdsLib
+			iMode = 0;
+			ioctlsocket(m_Socket, FIONBIO, &iMode);
 #else
-			m_DestAddrLen = rp->ai_addrlen;
+			int flags = fcntl(m_Socket, F_GETFL, 0);
+			fcntl(m_Socket, F_SETFL, flags | O_NONBLOCK);
+
+			int connectResult = ::connect(m_Socket, rp->ai_addr, rp->ai_addrlen);
+			if (connectResult < 0 && errno == EINPROGRESS) {
+				fd_set writeSet;
+				FD_ZERO(&writeSet);
+				FD_SET(m_Socket, &writeSet);
+
+				uint32_t userTimeout = g_connectionTimeoutMs.load();
+				timeval tv;
+				tv.tv_sec = userTimeout / 1000;
+				tv.tv_usec = (userTimeout % 1000) * 1000;
+
+				int selectResult = select(m_Socket + 1, nullptr, &writeSet, nullptr, &tv);
+				if (selectResult <= 0) {
+					::close(m_Socket);
+					m_Socket = INVALID_SOCKET;
+					continue;
+				}
+
+				int so_error = 0;
+				socklen_t len = sizeof(so_error);
+				getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, &so_error, &len);
+				if (so_error != 0) {
+					::close(m_Socket);
+					m_Socket = INVALID_SOCKET;
+					continue;
+				}
+			} else if (connectResult < 0) {
+				::close(m_Socket);
+				m_Socket = INVALID_SOCKET;
+				continue;
+			}
+
+			// Возвращаем сокет в блокирующий режим для стабильной работы AdsLib
+			fcntl(m_Socket, F_SETFL, flags);
 #endif
+			// ------------------------------------------------------------------------
 		}
 		memcpy(&m_SockAddress, rp->ai_addr,
 		       std::min<size_t>(sizeof(m_SockAddress), rp->ai_addrlen));
