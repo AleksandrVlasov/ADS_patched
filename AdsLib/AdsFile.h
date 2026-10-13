@@ -26,21 +26,3 @@ enum FOPEN : uint32_t {
 };
 }
 }
-
-struct AdsFile {
-	AdsFile(const AdsDevice &route, const std::string &filename,
-		uint32_t flags);
-	void Read(const size_t size, void *data, uint32_t &bytesRead) const;
-	void Write(const size_t size, const void *data) const;
-
-	static void Delete(const AdsDevice &route, const std::string &filename,
-			   uint32_t flags);
-	static int Find(const AdsDevice &route, const std::string &path,
-			const size_t maxdepth, std::ostream &os);
-	static void Rename(const AdsDevice &route, const std::string &source,
-			   const std::string &destination, uint32_t flags);
-
-    private:
-	const AdsDevice &m_Route;
-	const AdsHandle m_Handle;
-};

@@ -1,7 +1,7 @@
 set(LIB_SOURCES
         AdsDef.cpp
         AdsDevice.cpp
-        AdsFile.cpp
+
         AdsLib.cpp
         ECatAccess.cpp
         Frame.cpp
