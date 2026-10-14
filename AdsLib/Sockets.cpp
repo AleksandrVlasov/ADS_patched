@@ -5,13 +5,18 @@
 
 #include "Sockets.h"
 #include "Log.h"
-
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <sstream>
 #include <system_error>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <errno.h>
+#endif
 
 std::atomic<uint32_t> g_connectionTimeoutMs{1000};
 
@@ -131,56 +136,37 @@ Socket::Socket(const struct addrinfo *const host, const int type)
 		}
 
 		if (SOCK_STREAM == type) {
-// --- НЕБЛОКИРУЮЩИЙ CONNECT ДЛЯ WINDOWS И LINUX ---
+// --- ИСПРАВЛЕНО: НЕБЛОКИРУЮЩИЙ CONNECT ДЛЯ WINDOWS С ДИНАМИЧЕСКИМ ТАЙМАУТОМ ---
 #if defined(_WIN32)
 			// 1. Временно переводим сокет в НЕБЛОКИРУЮЩИЙ режим
 			unsigned long iMode = 1;
 			ioctlsocket(m_Socket, FIONBIO, &iMode);
 
 			// 2. Асинхронно запускаем попытку подключения
-			int connectResult = ::connect(m_Socket, rp->ai_addr, (int)rp->ai_addrlen);
+			int connectResult = ::connect(m_Socket, rp->ai_addr, rp->ai_addrlen);
 
-			// Если соединение не установилось мгновенно (норма для неблокирующего режима)
+			// Если соединение не установилось мгновенно
 			if (connectResult == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
 				fd_set writeSet;
-				fd_set exceptSet; // Windows сообщает об ошибках коннекта здесь!
-
 				FD_ZERO(&writeSet);
-				FD_ZERO(&exceptSet);
 				FD_SET(m_Socket, &writeSet);
-				FD_SET(m_Socket, &exceptSet);
 
-				// Загружаем актуальное значение таймаута из GUI
+				// Загружаем актуальное значение, выставленное юзером в GUI
 				uint32_t userTimeout = g_connectionTimeoutMs.load();
 
 				timeval tv;
-				tv.tv_sec = userTimeout / 1000;
-				tv.tv_usec = (userTimeout % 1000) * 1000;
+				tv.tv_sec = userTimeout / 1000;          // Целые секунды (например, 1)
+				tv.tv_usec = (userTimeout % 1000) * 1000; // Оставшиеся микросекунды
 
-				// Контролируем время ожидания и ошибки
-				int selectResult = select(0, nullptr, &writeSet, &exceptSet, &tv);
+				// Контролируем время ожидания средствами быстрого select
+				int selectResult = select(0, nullptr, &writeSet, nullptr, &tv);
 
-				// Если вышло время (<=0) ИЛИ сокет попал в exceptSet (ошибка подключения)
-				if (selectResult <= 0 || FD_ISSET(m_Socket, &exceptSet)) {
+				if (selectResult <= 0) {
+					// Время вышло — ПЛК выключен!
 					closesocket(m_Socket);
 					m_Socket = INVALID_SOCKET;
-					continue; // Переходим к следующему адресу в цикле
+					continue; // Переходим к следующему rp в цикле, не тратя 21 секунду!
 				}
-
-				// ИСПРАВЛЕНИЕ: Дополнительная проверка на внутреннюю ошибку сокета
-				int so_error = 0;
-				int len = sizeof(so_error);
-				getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &len);
-				if (so_error != 0) {
-					closesocket(m_Socket);
-					m_Socket = INVALID_SOCKET;
-					continue;
-				}
-			} else if (connectResult == SOCKET_ERROR) {
-				// Любая другая мгновенная ошибка (например, сеть недоступна)
-				closesocket(m_Socket);
-				m_Socket = INVALID_SOCKET;
-				continue;
 			}
 
 			// 3. Возвращаем сокет обратно в БЛОКИРУЮЩИЙ режим для стабильной работы AdsLib
@@ -203,6 +189,7 @@ Socket::Socket(const struct addrinfo *const host, const int type)
 
 				int selectResult = select(m_Socket + 1, nullptr, &writeSet, nullptr, &tv);
 				if (selectResult <= 0) {
+					// Время вышло (ПЛК оффлайн) — закрываем сразу, не вися 2 минуты!
 					::close(m_Socket);
 					m_Socket = INVALID_SOCKET;
 					continue;
@@ -226,6 +213,7 @@ Socket::Socket(const struct addrinfo *const host, const int type)
 			fcntl(m_Socket, F_SETFL, flags);
 #endif
 			// ------------------------------------------------------------------------
+
 		}
 		memcpy(&m_SockAddress, rp->ai_addr,
 		       std::min<size_t>(sizeof(m_SockAddress), rp->ai_addrlen));
@@ -234,6 +222,7 @@ Socket::Socket(const struct addrinfo *const host, const int type)
 	LOG_ERROR("Unable to create socket");
 	throw std::system_error(WSAGetLastError(), std::system_category());
 }
+
 
 Socket::~Socket()
 {
@@ -257,7 +246,7 @@ size_t Socket::read(uint8_t *buffer, size_t maxBytes, timeval *timeout) const
 	}
 
 	const auto msvcMaxBytes = static_cast<int>(
-		std::min<size_t>(std::numeric_limits<int>::max(), maxBytes));
+		std::min<size_t>((std::numeric_limits<int>::max)(), maxBytes));
 	const int bytesRead = recv(m_Socket, reinterpret_cast<char *>(buffer),
 				   msvcMaxBytes, 0);
 	if (bytesRead > 0) {
@@ -291,10 +280,39 @@ bool Socket::Select(timeval *timeout) const
 	FD_ZERO(&readSockets);
 	FD_SET(m_Socket, &readSockets);
 
+	// --- ИСПРАВЛЕНО: ДИНАМИЧЕСКИЙ ТАЙМАУТ ПОЛЬЗОВАТЕЛЯ ИЗ QT ---
+	timeval customTimeout;
+
+	// Если библиотека передала nullptr (вечное чтение) или оригинальный таймаут слишком большой,
+	// мы принудительно берем актуальное значение g_connectionTimeoutMs, установленное юзером!
+	if (!timeout) {
+		uint32_t userTimeout = g_connectionTimeoutMs.load();
+		customTimeout.tv_sec = userTimeout / 1000;
+		customTimeout.tv_usec = (userTimeout % 1000) * 1000;
+	} else {
+		customTimeout = *timeout;
+		uint32_t userTimeout = g_connectionTimeoutMs.load();
+		uint32_t currentTimeoutMs = (customTimeout.tv_sec * 1000) + (customTimeout.tv_usec / 1000);
+
+		// Если системный таймаут больше пользовательского — урезаем его до рамок юзера
+		if (currentTimeoutMs > userTimeout) {
+			customTimeout.tv_sec = userTimeout / 1000;
+			customTimeout.tv_usec = (userTimeout % 1000) * 1000;
+		}
+	}
+	// -------------------------------------------------------------
+
 	/* wait for receive data */
+	// Передаем customTimeout вместо оригинального timeout во всех сценариях
 	const int state = NATIVE_SELECT(m_Socket + 1, &readSockets, nullptr,
-					nullptr, timeout);
+					nullptr, &customTimeout);
+
 	if (0 == state) {
+		// Если оригинальный таймаут был nullptr, значит это фоновый поток ожидания AdsLib.
+		// Мы возвращаем false без исключения, чтобы не ломать поток, а дать ему сделать пустой круг.
+		if (!timeout) {
+			return false;
+		}
 		LOG_ERROR("select() timeout");
 		throw TimeoutEx("select() timeout");
 	}
@@ -315,9 +333,11 @@ bool Socket::Select(timeval *timeout) const
 	return true;
 }
 
+
+
 size_t Socket::write(const Frame &frame) const
 {
-	if (frame.size() > std::numeric_limits<int>::max()) {
+	if (frame.size() > (std::numeric_limits<int>::max)()) {
 		LOG_ERROR("frame length: "
 			  << frame.size()
 			  << " exceeds maximum length for sockets");

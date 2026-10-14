@@ -80,13 +80,11 @@ long AmsRouter::AddRoute(AmsNetId ams, const std::string &host)
 		}
 
 		return -1;
-	} catch (...) {
-		if (!lock.owns_lock()) {
-			lock.lock();
-		}
+	} catch (std::exception &e) {
+		lock.lock();
 		connection_attempts.erase(ams);
 		connection_attempt_events.notify_all();
-		throw;
+	return 6;
 	}
 }
 
